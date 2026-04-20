@@ -77,11 +77,18 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
         # Tracks whether we have emitted the first content delta past the
         # <|channel>response transition — used to strip the leading newline.
         self._content_seen: bool = False
+        # Per-reasoning-block state for "thought\n" prefix stripping.
+        # Reset each time we enter a new thinking phase (initial entry
+        # from pre_think, or re-entry from content).
+        self._block_thought_buffer: str = ""
+        self._block_thought_done: bool = False
 
     def reset_state(self):
         super().reset_state()
         self._pending = ""
         self._content_seen = False
+        self._block_thought_buffer = ""
+        self._block_thought_done = False
 
     def _trailing_partial_marker_len(self, text: str) -> int:
         """
@@ -243,30 +250,54 @@ class Gemma4ReasoningParser(BaseThinkingReasoningParser):
                     return DeltaMessage(content=stripped)
                 return DeltaMessage(content=delta_text)
 
-        # Delegate to base class for standard <|channel>/<channel|> handling
+        # Delegate to base class. Track phase transitions around the call
+        # so we can reset per-block "thought\n" prefix tracking whenever a
+        # new thinking phase begins (initial entry OR re-entry from
+        # content via the base parser's multi-block logic).
+        pre_phase = self._phase
         result = super().extract_reasoning_streaming(
             previous_text, current_text, delta_text
         )
+        if pre_phase != "thinking" and self._phase == "thinking":
+            self._block_thought_buffer = ""
+            self._block_thought_done = False
 
-        # Strip "thought" channel name from initial reasoning
-        if result is not None and result.reasoning is not None:
-            # First reasoning delta after <|channel> will be "thought" or "thought\n"
-            if self.start_token in current_text:
-                # Check if this is the very first reasoning content
-                after_channel = current_text.split(self.start_token, 1)[1]
-                if after_channel.startswith(_THOUGHT_PREFIX):
-                    # Remove "thought" prefix from the accumulated reasoning so far
-                    clean = after_channel[len(_THOUGHT_PREFIX) :].lstrip("\n")
-                    # Compute what portion of clean text is in this delta
-                    prev_after = ""
-                    if self.start_token in previous_text:
-                        prev_after = previous_text.split(self.start_token, 1)[1]
-                        if prev_after.startswith(_THOUGHT_PREFIX):
-                            prev_after = prev_after[len(_THOUGHT_PREFIX) :].lstrip("\n")
-                    # The new reasoning text is clean minus what was already emitted
-                    new_reasoning = clean[len(prev_after) :]
-                    if new_reasoning:
-                        return DeltaMessage(reasoning=new_reasoning)
-                    return None  # Suppress channel name token
+        if result is None or result.reasoning is None:
+            return result
 
+        # Per-block "thought\n" prefix stripping. Operates on the
+        # reasoning text received from the base parser (which is already
+        # just this block's contribution, not the entire accumulated
+        # stream) so it handles back-to-back <|channel>thought<channel|>
+        # blocks correctly.
+        if self._block_thought_done:
+            return result
+
+        self._block_thought_buffer += result.reasoning
+        buf = self._block_thought_buffer
+        if buf.startswith(_THOUGHT_PREFIX):
+            prev_reasoning_len = len(buf) - len(result.reasoning)
+            prefix_len = len(_THOUGHT_PREFIX)
+            if prev_reasoning_len >= prefix_len:
+                # Prefix consumed by prior deltas; this delta is real content.
+                self._block_thought_done = True
+                return result
+            chars_in_delta = prefix_len - prev_reasoning_len
+            stripped = result.reasoning[chars_in_delta:].lstrip("\n")
+            if stripped:
+                self._block_thought_done = True
+                result.reasoning = stripped
+                return result
+            # Delta was entirely prefix (or prefix + newline) — suppress.
+            if len(buf) >= prefix_len:
+                self._block_thought_done = True
+            return None
+
+        if _THOUGHT_PREFIX.startswith(buf):
+            # Buffer is a strict prefix of _THOUGHT_PREFIX; wait.
+            return None
+
+        # Diverged — text isn't "thought\n…". Emit whatever we accumulated.
+        self._block_thought_done = True
+        result.reasoning = buf
         return result

@@ -185,9 +185,13 @@ class BaseThinkingReasoningParser(ReasoningParser):
             return DeltaMessage(reasoning=delta_text)
 
         # ── Phase: thinking ───────────────────────────────────────
-        # Inside a reasoning block, waiting for end tag.
+        # Inside a reasoning block, waiting for end tag. Use a count
+        # comparison rather than "in current but not previous" so this
+        # works when the model emits multiple back-to-back reasoning
+        # blocks (previous already contains an earlier end_tok from a
+        # prior block).
         if self._phase == "thinking":
-            if end_tok in current_text and end_tok not in previous_text:
+            if current_text.count(end_tok) > previous_text.count(end_tok):
                 self._phase = "content"
                 idx = delta_text.find(end_tok)
                 if idx >= 0:
