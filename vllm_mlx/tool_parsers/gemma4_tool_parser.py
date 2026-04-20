@@ -287,12 +287,80 @@ def _make_tool_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:24]}"
 
 
-# Matches a complete tool call. Function names may contain letters,
-# digits, underscores, hyphens, and dots.
+# Regex matching a complete tool call — used by the streaming parser's
+# end-of-call flush. Function names may contain letters, digits,
+# underscores, hyphens, and dots.
 _TOOL_CALL_REGEX = re.compile(
     r"<\|tool_call>call:([\w\-\.]+)\{(.*?)\}<tool_call\|>",
     re.DOTALL,
 )
+
+# Helpers kept from the pre-port non-streaming parser. These handle
+# edge cases the streaming-oriented _parse_gemma4_args cannot (multiple
+# ``call:name{...}`` inside a single ``<|tool_call>...<tool_call|>``
+# block, and ``<|"|>``-quoted keys).
+
+_PLACEHOLDER_RE = re.compile(r"\x00(\d+)\x00")
+_STRING_DELIM_RE = re.compile(r'<\|"\|>(.*?)<\|"\|>', re.DOTALL)
+_CALL_PREFIX = re.compile(r"call:([\w\-\.]+)\s*\{")
+_BARE_KEY = re.compile(r"(?<=[{,])\s*([\w\-\.]+)\s*:")
+_MAX_ARG_BLOCK_LEN = 1_048_576
+
+
+def _find_balanced_brace(text: str, start: int) -> int:
+    """Find the index of the closing ``}`` balancing the ``{`` at ``start``.
+
+    Skips over ``<|"|>``-delimited string regions so braces inside string
+    values don't affect depth counting.
+    """
+    if len(text) - start > _MAX_ARG_BLOCK_LEN:
+        return -1
+    depth = 0
+    i = start
+    in_string = False
+    n = len(text)
+    while i < n:
+        if text.startswith(STRING_DELIM, i):
+            in_string = not in_string
+            i += len(STRING_DELIM)
+            continue
+        if not in_string:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return -1
+
+
+def _gemma4_args_to_json(text: str) -> str:
+    """Convert a Gemma 4 ``{...}``-delimited argument body into valid JSON.
+
+    Three-step conversion (ORDER MATTERS):
+
+    1. Extract ``<|"|>``-delimited strings into numbered ``\\x00N\\x00``
+       placeholders — protects string contents from the bare-key quoting
+       in step 2.
+    2. Quote bare keys (``word:`` → ``"word":``).
+    3. Restore placeholders as properly JSON-escaped strings.
+    """
+    strings: list[str] = []
+
+    def _capture(m: re.Match) -> str:
+        strings.append(m.group(1))
+        return f"\x00{len(strings) - 1}\x00"
+
+    text = _STRING_DELIM_RE.sub(_capture, text)
+    text = _BARE_KEY.sub(r'"\1":', text)
+
+    def _restore(m: re.Match) -> str:
+        idx = int(m.group(1))
+        return json.dumps(strings[idx]) if idx < len(strings) else m.group(0)
+
+    text = _PLACEHOLDER_RE.sub(_restore, text)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -388,47 +456,80 @@ class Gemma4ToolParser(ToolParser):
         model_output: str,
         request: dict[str, Any] | None = None,
     ) -> ExtractedToolCallInformation:
-        """Extract all tool calls from a complete model response."""
+        """Extract all tool calls from a complete model response.
+
+        Block-scans between ``<|tool_call>`` / ``<tool_call|>`` markers,
+        then within each block matches each ``call:name{args}`` using
+        balanced-brace scanning. This correctly handles:
+
+        * Multiple ``call:name{...}`` inside a single ``<|tool_call>`` /
+          ``<tool_call|>`` block.
+        * ``<|"|>``-quoted keys (placeholder substitution via
+          ``_gemma4_args_to_json``).
+        * Braces inside string values (balanced-brace scan skips over
+          ``<|"|>``-delimited regions).
+        """
         cleaned = self.strip_think_tags(model_output)
 
-        if self.tool_call_start_token not in cleaned:
+        start_idx = cleaned.find(self.tool_call_start_token)
+        if start_idx == -1:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
 
-        matches = self.tool_call_regex.findall(cleaned)
-        if not matches:
-            return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
-            )
+        content_before = cleaned[:start_idx].strip() or None
+
+        # Collect each <|tool_call>...<tool_call|> block's interior text.
+        blocks: list[str] = []
+        pos = 0
+        while True:
+            b_start = cleaned.find(self.tool_call_start_token, pos)
+            if b_start == -1:
+                break
+            body_start = b_start + len(self.tool_call_start_token)
+            b_end = cleaned.find(self.tool_call_end_token, body_start)
+            if b_end == -1:
+                blocks.append(cleaned[body_start:])
+                break
+            blocks.append(cleaned[body_start:b_end])
+            pos = b_end + len(self.tool_call_end_token)
 
         tool_calls: list[dict[str, Any]] = []
-        for func_name, args_str in matches:
-            try:
-                arguments = _parse_gemma4_args(args_str)
-                tool_calls.append(
-                    {
-                        "id": _make_tool_call_id(),
-                        "name": func_name,
-                        "arguments": json.dumps(arguments, ensure_ascii=False),
-                    }
-                )
-            except Exception:
-                logger.exception(
-                    "Gemma 4 tool parser: failed to parse args for call:%s",
-                    func_name,
-                )
-
-        start_idx = cleaned.find(self.tool_call_start_token)
-        content = cleaned[:start_idx].strip() if start_idx > 0 else None
-        if not content:
-            content = None
+        for block in blocks:
+            bpos = 0
+            while bpos < len(block):
+                m = _CALL_PREFIX.search(block, bpos)
+                if not m:
+                    break
+                func_name = m.group(1)
+                brace_start = m.end() - 1
+                brace_end = _find_balanced_brace(block, brace_start)
+                if brace_end == -1:
+                    bpos = m.end()
+                    continue
+                args_raw = block[brace_start : brace_end + 1]
+                try:
+                    args_json = _gemma4_args_to_json(args_raw)
+                    json.loads(args_json)  # validate
+                    tool_calls.append(
+                        {
+                            "id": _make_tool_call_id(),
+                            "name": func_name,
+                            "arguments": args_json,
+                        }
+                    )
+                except (json.JSONDecodeError, ValueError):
+                    logger.warning(
+                        "Gemma 4 tool parser: failed to parse args for call:%s",
+                        func_name,
+                    )
+                bpos = brace_end + 1
 
         if tool_calls:
             return ExtractedToolCallInformation(
                 tools_called=True,
                 tool_calls=tool_calls,
-                content=content,
+                content=content_before,
             )
         return ExtractedToolCallInformation(
             tools_called=False, tool_calls=[], content=model_output
