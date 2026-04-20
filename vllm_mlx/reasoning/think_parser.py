@@ -205,5 +205,34 @@ class BaseThinkingReasoningParser(ReasoningParser):
             return DeltaMessage(reasoning=delta_text)
 
         # ── Phase: content ────────────────────────────────────────
-        # Past the reasoning block — everything is content.
+        # Past the reasoning block. Models like Gemma 4 can re-open a
+        # thinking block mid-response; detect that and route accordingly
+        # so start/end tags don't leak through as literal content.
+        if start_tok in delta_text:
+            start_idx = delta_text.find(start_tok)
+            pre_content = delta_text[:start_idx]
+            after_start = delta_text[start_idx + len(start_tok):]
+
+            if end_tok in after_start:
+                # start + end both in this delta: emit any content before
+                # the start, reasoning between, content after. Phase stays
+                # "content" since we ended again.
+                end_idx = after_start.find(end_tok)
+                reasoning = after_start[:end_idx]
+                post_content = after_start[end_idx + len(end_tok):]
+                combined_content = pre_content + post_content
+                if not combined_content and not reasoning:
+                    return None
+                return DeltaMessage(
+                    content=combined_content or None,
+                    reasoning=reasoning or None,
+                )
+
+            # Only start token — re-enter thinking phase.
+            self._phase = "thinking"
+            return DeltaMessage(
+                content=pre_content or None,
+                reasoning=after_start or None,
+            )
+
         return DeltaMessage(content=delta_text)

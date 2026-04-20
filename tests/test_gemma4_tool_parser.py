@@ -184,8 +184,17 @@ class TestGemma4ToolParserStreaming:
         )
         assert result == {"content": "Hello"}
 
-    def test_streaming_suppresses_during_tool_call(self):
-        """Returns None while inside tool call block (buffering)."""
+    def test_streaming_progressive_emission(self):
+        """Inside an open tool call:
+
+        * content before the call passes through,
+        * the delta that opens the call + starts the name is suppressed
+          (no ``{`` yet, name incomplete),
+        * the delta that completes the name + ``{args...`` emits a
+          structured tool_calls chunk carrying the name (empty
+          ``arguments`` — the OpenAI API convention for "name known,
+          args still streaming").
+        """
         r1 = self.parser.extract_tool_calls_streaming(
             previous_text="",
             current_text="Sure. ",
@@ -198,6 +207,7 @@ class TestGemma4ToolParserStreaming:
             current_text="Sure. <|tool_call>call:read",
             delta_text="<|tool_call>call:read",
         )
+        # Name isn't complete until the opening brace arrives.
         assert r2 is None
 
         r3 = self.parser.extract_tool_calls_streaming(
@@ -205,7 +215,13 @@ class TestGemma4ToolParserStreaming:
             current_text='Sure. <|tool_call>call:read_file{path:<|"|>/tmp/foo<|"|>}',
             delta_text='_file{path:<|"|>/tmp/foo<|"|>}',
         )
-        assert r3 is None
+        # Progressive streaming: name is emitted as soon as it's parseable.
+        assert r3 is not None and "tool_calls" in r3
+        tc = r3["tool_calls"][0]
+        assert tc["index"] == 0
+        assert tc["type"] == "function"
+        assert tc["function"]["name"] == "read_file"
+        assert tc["function"]["arguments"] == ""
 
     def test_streaming_emits_on_close(self):
         """Emits structured tool_calls when end delimiter arrives."""
@@ -224,6 +240,137 @@ class TestGemma4ToolParserStreaming:
         assert tc["function"]["name"] == "read_file"
         assert tc["type"] == "function"
         assert tc["index"] == 0
+
+
+class TestGemma4ToolParserStreamingRegressions:
+    """Tests for the bugs fixed in the upstream-port of the streaming
+    parser. These all exercise code paths the old vllm-mlx implementation
+    silently broke: content after close, partial-prefix leakage, and
+    progressive argument streaming.
+    """
+
+    def _run_stream(self, tokens):
+        """Helper: feed token list through the parser and collect results."""
+        parser = Gemma4ToolParser()
+        parser.reset()
+        accumulated = ""
+        events: list[dict] = []
+        for tok in tokens:
+            prev = accumulated
+            accumulated += tok
+            r = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=accumulated,
+                delta_text=tok,
+            )
+            if r is not None:
+                events.append(r)
+        return events
+
+    def test_content_after_closed_tool_call_not_dropped(self):
+        """After <tool_call|> arrives, subsequent plain text must still
+        reach the client as content. The old vllm-mlx parser fell through
+        to ``return None`` once ``has_start=True`` was latched, silently
+        dropping everything after the first close.
+        """
+        tokens = [
+            "I'll read it. ",
+            "<|tool_call>",
+            "call:read_file",
+            '{path:<|"|>/tmp/x<|"|>}',
+            "<tool_call|>",
+            "All done.",
+        ]
+        events = self._run_stream(tokens)
+
+        contents = [e["content"] for e in events if "content" in e]
+        tool_events = [e for e in events if "tool_calls" in e]
+
+        # Prior content before the call and post-call content both appear.
+        full_content = "".join(contents)
+        assert "I'll read it." in full_content
+        assert "All done." in full_content
+        # Neither delimiter leaks into content.
+        assert "<|tool_call>" not in full_content
+        assert "<tool_call|>" not in full_content
+        # The tool call itself was emitted (at least one structured chunk).
+        assert tool_events, "tool call should have produced structured events"
+
+    def test_partial_start_token_at_delta_boundary_is_buffered(self):
+        """A delta that is itself a proper prefix of ``<|tool_call>`` must
+        be buffered — it must NOT reach the client as literal content.
+        Once the next delta completes the start token, the parser
+        transitions into tool-call mode.
+        """
+        parser = Gemma4ToolParser()
+        parser.reset()
+
+        # Delta #1: buffered entirely (proper prefix of start token,
+        # nothing else to emit). Returning None is the correct outcome.
+        curr1 = "<|tool"
+        r1 = parser.extract_tool_calls_streaming(
+            previous_text="",
+            current_text=curr1,
+            delta_text="<|tool",
+        )
+        assert r1 is None or "<|tool" not in (r1.get("content") or "")
+
+        # Delta #2: completes the start token.
+        prev2, curr2 = curr1, curr1 + "_call>"
+        r2 = parser.extract_tool_calls_streaming(
+            previous_text=prev2,
+            current_text=curr2,
+            delta_text="_call>",
+        )
+        # State has advanced into a tool call.
+        assert "<|tool_call>" in curr2
+        assert parser.current_tool_id == 0
+        # Neither delta leaked the partial prefix as content.
+        emitted = [r1, r2]
+        content_so_far = "".join(
+            (r.get("content") or "") for r in emitted if isinstance(r, dict)
+        )
+        assert "<|tool" not in content_so_far
+
+    def test_progressive_streaming_emits_name_then_args(self):
+        """Within a tool call, the name is emitted first (empty args),
+        then subsequent argument content is diffed incrementally. The
+        final close flushes any remaining suffix so the concatenated
+        ``arguments`` stream is a valid JSON object.
+        """
+        tokens = [
+            "<|tool_call>",
+            "call:search",
+            "{query:",
+            '<|"|>hello world<|"|>',
+            ",limit:10",
+            "}",
+            "<tool_call|>",
+        ]
+        events = self._run_stream(tokens)
+
+        # All structured events for tool index 0.
+        tc_events = [
+            tc
+            for e in events
+            if "tool_calls" in e
+            for tc in e["tool_calls"]
+            if tc.get("index") == 0
+        ]
+        assert tc_events, "expected at least one structured tool_call event"
+
+        # First structured chunk carries the name.
+        first = tc_events[0]
+        assert first["function"]["name"] == "search"
+        assert first["function"]["arguments"] == ""
+        assert "id" in first and first["id"].startswith("call_")
+
+        # Concatenate argument fragments — must parse as valid JSON.
+        args_stream = "".join(
+            tc["function"].get("arguments", "") for tc in tc_events
+        )
+        parsed = json.loads(args_stream)
+        assert parsed == {"query": "hello world", "limit": 10}
 
 
 class TestGemma4Registration:

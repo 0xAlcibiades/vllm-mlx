@@ -1187,6 +1187,57 @@ class TestGemma4Parser:
         assert "very long reasoning process" in full_reasoning
         assert len(content_parts) == 0
 
+    def test_streaming_back_to_back_thought_blocks(self, parser):
+        """Two consecutive <|channel>thought...<channel|> blocks must not
+        leak the markers as content. Gemma 4 sometimes emits multiple
+        empty/short thought blocks before the visible answer, and older
+        versions of this parser transitioned to "content" after the first
+        </channel|> and then passed the second block through verbatim
+        (the source of the <|channel>thought<channel|> cascade seen in
+        opencode/Hermes).
+        """
+        parser.reset_state()
+
+        tokens = [
+            "<|channel>",
+            "thought",
+            "\n",
+            "first reasoning",
+            "<channel|>",
+            "<|channel>",
+            "thought",
+            "\n",
+            "second reasoning",
+            "<channel|>",
+            "final answer",
+        ]
+
+        accumulated = ""
+        reasoning_parts = []
+        content_parts = []
+
+        for token in tokens:
+            prev = accumulated
+            accumulated += token
+            result = parser.extract_reasoning_streaming(prev, accumulated, token)
+            if result:
+                if result.reasoning:
+                    reasoning_parts.append(result.reasoning)
+                if result.content:
+                    content_parts.append(result.content)
+
+        full_reasoning = "".join(reasoning_parts)
+        full_content = "".join(content_parts)
+
+        # Neither the start nor end channel markers should leak into content.
+        assert "<|channel>" not in full_content
+        assert "<channel|>" not in full_content
+        # Both reasoning blocks' content should survive.
+        assert "first reasoning" in full_reasoning
+        assert "second reasoning" in full_reasoning
+        # The final visible answer should land in content.
+        assert "final answer" in full_content
+
 
 class TestGlm4Parser:
     """Tests for the GLM-4 reasoning parser."""
